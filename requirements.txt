@@ -1,0 +1,6 @@
+python-telegram-bot
+pytube
+google-cloud-vision
+requests
+python-dotenv
+ffmpeg-python
