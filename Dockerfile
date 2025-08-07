@@ -8,7 +8,10 @@ RUN apt-get update && \
     tesseract-ocr \
     tesseract-ocr-rus \
     tesseract-ocr-eng \
+    tesseract-ocr-script-latn \
+    tesseract-ocr-script-cyrl \
     libgl1-mesa-glx \
+    libglib2.0-0 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
