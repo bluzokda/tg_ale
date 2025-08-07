@@ -21,44 +21,43 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация API
-OMDB_API_URL = "http://www.omdbapi.com/"
+TMDB_API_URL = "https://api.themoviedb.org/3/"
 
 def check_ffmpeg():
     """Проверяет доступность ffmpeg в системе"""
     try:
-        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
-        logger.info(f"FFmpeg version: {result.stdout.splitlines()[0] if result.stdout else 'Unknown'}")
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        logger.info("FFmpeg доступен")
         return True
     except Exception as e:
-        logger.error(f"FFmpeg check failed: {e}")
+        logger.error(f"Ошибка проверки FFmpeg: {e}")
         return False
 
 def download_video(url: str) -> str:
     """Скачивает видео и возвращает путь к файлу"""
     try:
         if "youtube.com" in url or "youtu.be" in url:
-            logger.info(f"Downloading YouTube video: {url}")
+            logger.info(f"Скачивание YouTube видео: {url}")
             yt = YouTube(url)
-            # Скачиваем только аудиодорожку для экономии ресурсов
             stream = yt.streams.filter(only_audio=True, file_extension='mp4').first()
             if not stream:
-                raise ValueError("No suitable stream found")
+                raise ValueError("Подходящий поток не найден")
                 
             temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
             stream.download(filename=temp_file.name)
-            logger.info(f"Video downloaded to: {temp_file.name}")
+            logger.info(f"Видео сохранено: {temp_file.name}")
             return temp_file.name
         else:
-            raise ValueError("Unsupported video source")
+            raise ValueError("Неподдерживаемый источник видео")
     except Exception as e:
-        logger.error(f"Error downloading video: {e}")
+        logger.error(f"Ошибка скачивания видео: {e}")
         raise
 
 def extract_frame(video_path: str, timestamp: int = 5) -> str:
     """Извлекает кадр из видео в указанной секунде"""
     try:
         frame_path = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False).name
-        logger.info(f"Extracting frame at {timestamp}s from: {video_path}")
+        logger.info(f"Извлечение кадра из: {video_path}")
         
         (
             ffmpeg
@@ -66,10 +65,10 @@ def extract_frame(video_path: str, timestamp: int = 5) -> str:
             .output(frame_path, vframes=1, qscale=0)
             .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
         )
-        logger.info(f"Frame saved to: {frame_path}")
+        logger.info(f"Кадр сохранен: {frame_path}")
         return frame_path
     except Exception as e:
-        logger.error(f"Error extracting frame: {e}")
+        logger.error(f"Ошибка извлечения кадра: {e}")
         raise
 
 def detect_content(image_path: str) -> str:
@@ -82,83 +81,136 @@ def detect_content(image_path: str) -> str:
         
         image = vision.Image(content=content)
         
-        # Используем web detection для лучших результатов
+        # Улучшенное распознавание с фокусировкой на медиа-контенте
         response = client.web_detection(image=image)
         web_detection = response.web_detection
         
-        # Собираем результаты
-        results = []
+        # Приоритет для лучших совпадений и веб-сущностей
+        best_guess = ""
+        if web_detection.best_guess_labels:
+            best_guess = web_detection.best_guess_labels[0].label
         
-        if web_detection.full_matching_images:
-            results.extend([img.url for img in web_detection.full_matching_images][:3])
-            
-        if web_detection.pages_with_matching_images:
-            results.extend([page.url for page in web_detection.pages_with_matching_images][:3])
+        # Собираем все релевантные описания
+        descriptions = set()
+        if best_guess:
+            descriptions.add(best_guess)
             
         if web_detection.web_entities:
-            results.extend([entity.description for entity in web_detection.web_entities if entity.description][:5])
-            
-        if web_detection.best_guess_labels:
-            results.extend([label.label for label in web_detection.best_guess_labels])
+            for entity in web_detection.web_entities:
+                if entity.description and entity.score > 0.7:
+                    descriptions.add(entity.description)
         
-        return " ".join(set(results)) if results else ""
+        # Фильтруем результаты для медиа-контента
+        media_keywords = {"movie", "film", "tv", "series", "episode", "show", "scene"}
+        filtered = [desc for desc in descriptions 
+                   if any(kw in desc.lower() for kw in media_keywords)]
+        
+        return filtered[0] if filtered else best_guess
     except Exception as e:
-        logger.error(f"Error detecting content: {e}")
+        logger.error(f"Ошибка распознавания контента: {e}")
         return ""
 
-def search_media(title: str) -> str:
-    """Ищет медиа-контент через OMDb API"""
+def search_tmdb(query: str) -> dict:
+    """Ищет медиа-контент через TMDB API"""
     try:
+        # Прямой поиск по названию
+        search_url = f"{TMDB_API_URL}search/multi"
         params = {
-            'apikey': os.getenv('OMDB_API_KEY'),
-            't': title,
-            'type': 'movie,series,episode',
-            'plot': 'short'
+            'api_key': os.getenv('TMDB_API_KEY'),
+            'query': query,
+            'language': 'ru',
+            'include_adult': False
         }
         
-        logger.info(f"Searching media for: {title}")
-        response = requests.get(OMDB_API_URL, params=params, timeout=10)
-        data = response.json()
+        logger.info(f"Поиск в TMDB: {query}")
+        response = requests.get(search_url, params=params, timeout=10)
+        results = response.json().get('results', [])
         
-        if data.get('Response') == 'True':
-            result = (
-                f"🎬 {data['Title']} ({data['Year']})\n"
-                f"⭐ Рейтинг: {data.get('imdbRating', 'N/A')}/10\n"
-                f"📀 Тип: {data['Type'].capitalize()}\n"
-                f"📝 Описание: {data['Plot']}"
-            )
-            logger.info(f"Media found: {data['Title']}")
-            return result
-        return ""
+        if not results:
+            return {}
+        
+        # Выбираем лучший результат
+        best_result = max(results, key=lambda x: x.get('popularity', 0))
+        media_type = best_result['media_type']
+        
+        # Получаем детальную информацию
+        details_url = f"{TMDB_API_URL}{media_type}/{best_result['id']}"
+        details_params = {
+            'api_key': os.getenv('TMDB_API_KEY'),
+            'language': 'ru',
+            'append_to_response': 'videos'
+        }
+        
+        details = requests.get(details_url, params=details_params).json()
+        return details
     except Exception as e:
-        logger.error(f"Error searching media: {e}")
-        return ""
+        logger.error(f"Ошибка поиска в TMDB: {e}")
+        return {}
+
+def format_media_info(media_data: dict) -> str:
+    """Форматирует информацию о медиа-контенте"""
+    if not media_data:
+        return "Информация не найдена"
+    
+    # Определяем тип контента
+    media_type = media_data.get('media_type', 'movie')
+    title = media_data.get('title') or media_data.get('name', 'Без названия')
+    
+    # Базовая информация
+    year = media_data.get('release_date', '')[:4] or media_data.get('first_air_date', '')[:4]
+    rating = media_data.get('vote_average', 'N/A')
+    overview = media_data.get('overview', 'Описание отсутствует')
+    
+    # Дополнительная информация в зависимости от типа
+    if media_type == 'tv':
+        info = f"📺 Сериал: {title}"
+        if year:
+            info += f" ({year})"
+        if media_data.get('number_of_seasons'):
+            info += f"\n🔢 Сезонов: {media_data['number_of_seasons']}"
+        if media_data.get('number_of_episodes'):
+            info += f"\n🎬 Эпизодов: {media_data['number_of_episodes']}"
+    else:
+        info = f"🎬 Фильм: {title}"
+        if year:
+            info += f" ({year})"
+        if media_data.get('runtime'):
+            info += f"\n⏱ Длительность: {media_data['runtime']} мин"
+    
+    # Основная информация
+    info += f"\n⭐ Рейтинг: {rating}/10"
+    info += f"\n📝 Описание: {overview[:300]}{'...' if len(overview) > 300 else ''}"
+    
+    # Постер
+    if media_data.get('poster_path'):
+        info += f"\n\n🖼 https://image.tmdb.org/t/p/original{media_data['poster_path']}"
+    
+    # Трейлер
+    videos = media_data.get('videos', {}).get('results', [])
+    if videos:
+        youtube_trailers = [v for v in videos if v['site'] == 'YouTube' and v['type'] == 'Trailer']
+        if youtube_trailers:
+            info += f"\n\n🎥 Трейлер: https://www.youtube.com/watch?v={youtube_trailers[0]['key']}"
+    
+    return info
 
 def process_video(url: str) -> str:
     """Обрабатывает видео и возвращает результат"""
-    video_path = None
-    frame_path = None
+    video_path, frame_path = None, None
     
     try:
-        # Шаг 1: Скачивание видео
         video_path = download_video(url)
-        
-        # Шаг 2: Извлечение кадра
         frame_path = extract_frame(video_path)
-        
-        # Шаг 3: Анализ изображения
         content = detect_content(frame_path)
         
         if content:
-            logger.info(f"Detected content: {content}")
-            # Шаг 4: Поиск информации
-            media_info = search_media(content)
-            return media_info if media_info else f"Распознано: {content[:200]}..."
-        
+            logger.info(f"Распознано: {content}")
+            media_data = search_tmdb(content)
+            return format_media_info(media_data)
         return "Не удалось распознать контент"
     
     except Exception as e:
-        logger.error(f"Error processing video: {e}")
+        logger.error(f"Ошибка обработки видео: {e}")
         return "Ошибка обработки видео"
     
     finally:
@@ -167,11 +219,28 @@ def process_video(url: str) -> str:
             if path and os.path.exists(path):
                 try:
                     os.unlink(path)
-                    logger.info(f"Deleted temp file: {path}")
                 except Exception as e:
-                    logger.error(f"Error deleting file {path}: {e}")
-        
-        # Очистка памяти
+                    logger.error(f"Ошибка удаления файла {path}: {e}")
+        gc.collect()
+
+def process_image(image_path: str) -> str:
+    """Обрабатывает изображение и возвращает результат"""
+    try:
+        content = detect_content(image_path)
+        if content:
+            logger.info(f"Распознано: {content}")
+            media_data = search_tmdb(content)
+            return format_media_info(media_data)
+        return "Не удалось распознать контент на изображении"
+    except Exception as e:
+        logger.error(f"Ошибка обработки изображения: {e}")
+        return "Ошибка обработки изображения"
+    finally:
+        if image_path and os.path.exists(image_path):
+            try:
+                os.unlink(image_path)
+            except Exception as e:
+                logger.error(f"Ошибка удаления файла {image_path}: {e}")
         gc.collect()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -179,16 +248,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         user = update.effective_user
         await update.message.reply_text(
-            f"Привет, {user.mention_html()}! Отправь мне ссылку на YouTube видео, "
-            "и я попробую определить что это за фильм или сериал!",
+            f"Привет, {user.mention_html()}! Отправь мне:\n"
+            "1. Ссылку на YouTube видео\n"
+            "2. Скриншот из фильма/сериала\n"
+            "и я найду информацию о нем!",
             parse_mode='HTML'
         )
-        logger.info(f"Start command from {user.id}")
+        logger.info(f"Команда start от {user.id}")
     except Exception as e:
-        logger.error(f"Error in start command: {e}")
+        logger.error(f"Ошибка в команде start: {e}")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик текстовых сообщений"""
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик текстовых сообщений со ссылками"""
     try:
         url = update.message.text.strip()
         parsed_url = urlparse(url)
@@ -197,28 +268,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Пожалуйста, отправьте действительную URL-ссылку")
             return
         
-        logger.info(f"Processing URL: {url}")
+        logger.info(f"Обработка URL: {url}")
         await update.message.reply_text("🔍 Анализирую видео...")
         
         result = process_video(url)
-        await update.message.reply_text(result or "Не удалось определить контент")
+        await update.message.reply_text(result)
         
     except Exception as e:
-        logger.error(f"Error handling message: {e}")
-        await update.message.reply_text("⚠️ Произошла ошибка при обработке запроса")
+        logger.error(f"Ошибка обработки URL: {e}")
+        await update.message.reply_text("⚠️ Произошла ошибка при обработке видео")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик фотографий"""
+    try:
+        # Берем фото с самым высоким разрешением
+        photo_file = await update.message.photo[-1].get_file()
+        
+        # Сохраняем во временный файл
+        temp_file = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+        await photo_file.download_to_drive(temp_file.name)
+        logger.info(f"Фото сохранено: {temp_file.name}")
+        
+        await update.message.reply_text("🔍 Анализирую изображение...")
+        
+        # Обрабатываем изображение
+        result = process_image(temp_file.name)
+        await update.message.reply_text(result)
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки фото: {e}")
+        await update.message.reply_text("⚠️ Произошла ошибка при обработке изображения")
 
 def main() -> None:
     """Запуск бота"""
     try:
         logger.info("="*50)
-        logger.info("Starting application...")
-        logger.info(f"Python version: {sys.version}")
-        logger.info(f"Current directory: {os.getcwd()}")
-        logger.info(f"Files in directory: {os.listdir()}")
+        logger.info("Запуск приложения...")
+        logger.info(f"Версия Python: {sys.version}")
         
         # Проверка зависимостей
         if not check_ffmpeg():
-            logger.critical("FFmpeg not available! Exiting.")
+            logger.critical("FFmpeg недоступен! Завершение работы.")
             return
         
         # Загрузка переменных окружения
@@ -231,14 +321,15 @@ def main() -> None:
         
         # Регистрация обработчиков
         application.add_handler(CommandHandler("start", start))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         
         # Запуск
         logger.info("Бот запущен...")
         application.run_polling()
         
     except Exception as e:
-        logger.exception("CRITICAL ERROR DURING STARTUP")
+        logger.exception("КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ")
         raise
 
 if __name__ == '__main__':
