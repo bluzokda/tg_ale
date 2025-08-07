@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация API
-TMDB_API_URL = "https://api.themoviedb.org/3/"
+OMDB_API_URL = "http://www.omdbapi.com/"
 
 def check_ffmpeg():
     """Проверяет доступность ffmpeg в системе"""
@@ -110,41 +110,25 @@ def detect_content(image_path: str) -> str:
         logger.error(f"Ошибка распознавания контента: {e}")
         return ""
 
-def search_tmdb(query: str) -> dict:
-    """Ищет медиа-контент через TMDB API"""
+def search_media(title: str) -> dict:
+    """Ищет медиа-контент через OMDb API"""
     try:
-        # Прямой поиск по названию
-        search_url = f"{TMDB_API_URL}search/multi"
         params = {
-            'api_key': os.getenv('TMDB_API_KEY'),
-            'query': query,
-            'language': 'ru',
-            'include_adult': False
+            'apikey': os.getenv('OMDB_API_KEY'),
+            't': title,
+            'type': 'movie,series,episode',
+            'plot': 'short'
         }
         
-        logger.info(f"Поиск в TMDB: {query}")
-        response = requests.get(search_url, params=params, timeout=10)
-        results = response.json().get('results', [])
+        logger.info(f"Поиск медиа для: {title}")
+        response = requests.get(OMDB_API_URL, params=params, timeout=10)
+        data = response.json()
         
-        if not results:
-            return {}
-        
-        # Выбираем лучший результат
-        best_result = max(results, key=lambda x: x.get('popularity', 0))
-        media_type = best_result['media_type']
-        
-        # Получаем детальную информацию
-        details_url = f"{TMDB_API_URL}{media_type}/{best_result['id']}"
-        details_params = {
-            'api_key': os.getenv('TMDB_API_KEY'),
-            'language': 'ru',
-            'append_to_response': 'videos'
-        }
-        
-        details = requests.get(details_url, params=details_params).json()
-        return details
+        if data.get('Response') == 'True':
+            return data
+        return {}
     except Exception as e:
-        logger.error(f"Ошибка поиска в TMDB: {e}")
+        logger.error(f"Ошибка поиска медиа: {e}")
         return {}
 
 def format_media_info(media_data: dict) -> str:
@@ -152,45 +136,34 @@ def format_media_info(media_data: dict) -> str:
     if not media_data:
         return "Информация не найдена"
     
-    # Определяем тип контента
-    media_type = media_data.get('media_type', 'movie')
-    title = media_data.get('title') or media_data.get('name', 'Без названия')
+    # Основная информация
+    title = media_data.get('Title', 'Без названия')
+    year = media_data.get('Year', 'N/A')
+    media_type = media_data.get('Type', 'movie').capitalize()
+    rating = media_data.get('imdbRating', 'N/A')
+    plot = media_data.get('Plot', 'Описание отсутствует')
     
-    # Базовая информация
-    year = media_data.get('release_date', '')[:4] or media_data.get('first_air_date', '')[:4]
-    rating = media_data.get('vote_average', 'N/A')
-    overview = media_data.get('overview', 'Описание отсутствует')
+    # Форматирование ответа
+    info = f"🎬 {title} ({year})"
+    info += f"\n📀 Тип: {media_type}"
     
     # Дополнительная информация в зависимости от типа
-    if media_type == 'tv':
-        info = f"📺 Сериал: {title}"
-        if year:
-            info += f" ({year})"
-        if media_data.get('number_of_seasons'):
-            info += f"\n🔢 Сезонов: {media_data['number_of_seasons']}"
-        if media_data.get('number_of_episodes'):
-            info += f"\n🎬 Эпизодов: {media_data['number_of_episodes']}"
-    else:
-        info = f"🎬 Фильм: {title}"
-        if year:
-            info += f" ({year})"
-        if media_data.get('runtime'):
-            info += f"\n⏱ Длительность: {media_data['runtime']} мин"
+    if media_data.get('totalSeasons'):
+        info += f"\n🔢 Сезонов: {media_data['totalSeasons']}"
+    if media_data.get('Runtime'):
+        info += f"\n⏱ Длительность: {media_data['Runtime']}"
     
     # Основная информация
     info += f"\n⭐ Рейтинг: {rating}/10"
-    info += f"\n📝 Описание: {overview[:300]}{'...' if len(overview) > 300 else ''}"
+    info += f"\n📝 Описание: {plot[:300]}{'...' if len(plot) > 300 else ''}"
     
     # Постер
-    if media_data.get('poster_path'):
-        info += f"\n\n🖼 https://image.tmdb.org/t/p/original{media_data['poster_path']}"
+    if media_data.get('Poster') and media_data['Poster'] != 'N/A':
+        info += f"\n\n🖼 {media_data['Poster']}"
     
-    # Трейлер
-    videos = media_data.get('videos', {}).get('results', [])
-    if videos:
-        youtube_trailers = [v for v in videos if v['site'] == 'YouTube' and v['type'] == 'Trailer']
-        if youtube_trailers:
-            info += f"\n\n🎥 Трейлер: https://www.youtube.com/watch?v={youtube_trailers[0]['key']}"
+    # Ссылка на IMDb
+    if media_data.get('imdbID'):
+        info += f"\n\n🔗 https://www.imdb.com/title/{media_data['imdbID']}/"
     
     return info
 
@@ -205,7 +178,7 @@ def process_video(url: str) -> str:
         
         if content:
             logger.info(f"Распознано: {content}")
-            media_data = search_tmdb(content)
+            media_data = search_media(content)
             return format_media_info(media_data)
         return "Не удалось распознать контент"
     
@@ -229,7 +202,7 @@ def process_image(image_path: str) -> str:
         content = detect_content(image_path)
         if content:
             logger.info(f"Распознано: {content}")
-            media_data = search_tmdb(content)
+            media_data = search_media(content)
             return format_media_info(media_data)
         return "Не удалось распознать контент на изображении"
     except Exception as e:
@@ -315,6 +288,10 @@ def main() -> None:
         token = os.getenv('TELEGRAM_TOKEN')
         if not token:
             raise ValueError("TELEGRAM_TOKEN не установлен")
+        
+        # Проверка OMDb API ключа
+        if not os.getenv('OMDB_API_KEY'):
+            logger.warning("OMDB_API_KEY не установлен! Поиск медиа будет недоступен")
         
         # Инициализация бота
         application = Application.builder().token(token).build()
