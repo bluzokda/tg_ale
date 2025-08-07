@@ -3,11 +3,13 @@ import logging
 import tempfile
 import gc
 import re
+import time
 import requests
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance, ImageOps, ImageFilter
+from PIL import Image, ImageEnhance
 import pytesseract
+import telegram
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -23,83 +25,109 @@ OMDB_API_URL = "http://www.omdbapi.com/"
 KINOPOISK_API_URL = "https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword"
 
 def preprocess_image(image_path: str) -> Image.Image:
-    """Улучшает изображение для обработки OCR с использованием OpenCV"""
+    """Улучшает изображение для обработки OCR с использованием комбинированных методов"""
     try:
-        # Загрузка изображения с помощью OpenCV
+        # Загрузка изображения
         img = cv2.imread(image_path)
         if img is None:
             raise ValueError("Не удалось загрузить изображение")
         
-        # Уменьшение размера
+        # Уменьшение размера с сохранением соотношения сторон
         height, width = img.shape[:2]
         max_dim = 1200
-        if max(height, width) > max_dim:
-            scale = max_dim / max(height, width)
-            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        scale = max_dim / max(height, width)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
         
         # Конвертация в серый
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # Уменьшение шума
-        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        # Автоматическая коррекция контраста с CLAHE
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
         
-        # Адаптивная бинаризация
-        binary = cv2.adaptiveThreshold(
+        # Уменьшение шума с сохранением границ
+        denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
+        
+        # Определение типа фона и инверсия при необходимости
+        mean_val = np.mean(denoised)
+        if mean_val < 128:
+            denoised = cv2.bitwise_not(denoised)
+        
+        # Комбинированная бинаризация
+        # 1. Адаптивная бинаризация
+        adaptive_thresh = cv2.adaptiveThreshold(
             denoised, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 11, 2
+            cv2.THRESH_BINARY, 31, 8
         )
+        
+        # 2. Глобальная бинаризация Otsu
+        _, otsu_thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Комбинирование результатов
+        combined = cv2.bitwise_and(adaptive_thresh, otsu_thresh)
         
         # Увеличение резкости
         kernel = np.array([[-1, -1, -1], 
                            [-1, 9, -1], 
                            [-1, -1, -1]])
-        sharpened = cv2.filter2D(binary, -1, kernel)
+        sharpened = cv2.filter2D(combined, -1, kernel)
         
-        # Конвертация обратно в PIL Image
-        processed_img = Image.fromarray(sharpened)
-        return processed_img
+        return Image.fromarray(sharpened)
         
     except Exception as e:
-        logger.error(f"Ошибка обработки изображения OpenCV: {e}")
-        # Fallback: простая обработка PIL
+        logger.error(f"Ошибка обработки изображения: {e}")
         try:
+            # Fallback обработка
             img = Image.open(image_path)
             img.thumbnail((1200, 1200))
             img = img.convert('L')
             enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(2.0)
+            img = enhancer.enhance(3.0)
             enhancer = ImageEnhance.Sharpness(img)
-            img = enhancer.enhance(2.0)
+            img = enhancer.enhance(3.0)
             return img
         except Exception as e2:
-            logger.error(f"Ошибка обработки изображения PIL: {e2}")
+            logger.error(f"Ошибка fallback обработки: {e2}")
             return None
 
 def extract_text_with_tesseract(image: Image.Image) -> str:
     """Извлекает текст с изображения через Tesseract OCR с улучшениями"""
     try:
-        # Множественные попытки с разными параметрами
-        configs = [
-            r'--oem 3 --psm 6 -l eng+rus',
-            r'--oem 3 --psm 11 -l eng+rus',
-            r'--oem 3 --psm 4 -l eng+rus',
-            r'--oem 1 --psm 7 -l eng+rus'
+        # Множественные попытки с разными параметрами и языками
+        config_attempts = [
+            ('--oem 3 --psm 11', 'eng+rus'),       # Разреженный текст
+            ('--oem 3 --psm 6', 'eng+rus'),        # Единый блок текста
+            ('--oem 3 --psm 4', 'eng+rus'),        # Вертикальный текст
+            ('--oem 1 --psm 7', 'eng+rus'),        # Одна строка
+            ('--oem 3 --psm 11', 'equ+osd'),       # Оптическое распознавание символов
+            ('--oem 3 --psm 11', 'eng+rus+equ')    # Комбинированный
         ]
         
         best_text = ""
         best_score = 0
         
-        for config in configs:
-            text = pytesseract.image_to_string(image, config=config).strip()
+        for config, lang in config_attempts:
+            full_config = f"{config} -l {lang}"
+            text = pytesseract.image_to_string(image, config=full_config).strip()
             if not text:
                 continue
                 
             # Оценка качества текста
-            score = sum(1 for char in text if char.isalnum() or char.isspace())
+            alpha_count = sum(1 for c in text if c.isalpha())
+            digit_count = sum(1 for c in text if c.isdigit())
+            space_count = sum(1 for c in text if c.isspace())
+            total_chars = len(text)
+            
+            # Штраф за слишком много цифр или спецсимволов
+            score = alpha_count - 0.5 * digit_count - 0.3 * (total_chars - alpha_count - digit_count - space_count)
+            
             if score > best_score:
                 best_text = text
                 best_score = score
+                logger.info(f"Новый лучший текст: {text} (оценка: {score})")
                 
         return best_text
     except Exception as e:
@@ -426,34 +454,52 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("⚠️ Произошла ошибка при поиске информации")
 
 def main() -> None:
-    """Запуск бота"""
-    try:
-        logger.info("Запуск улучшенного бота...")
-        
-        # Проверка обязательных переменных
-        token = os.getenv('TELEGRAM_TOKEN')
-        if not token:
-            raise ValueError("TELEGRAM_TOKEN не установен")
-        
-        # Проверка API ключей
-        if not os.getenv('OMDB_API_KEY') and not os.getenv('KINOPOISK_API_KEY'):
-            logger.warning("API ключи для поиска медиа не установлены")
-        
-        # Инициализация бота
-        application = Application.builder().token(token).build()
-        
-        # Регистрация обработчиков
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-        
-        # Запуск
-        logger.info("Бот запущен...")
-        application.run_polling()
-        
-    except Exception as e:
-        logger.exception("Критическая ошибка при запуске")
-        raise
+    """Запуск бота с защитой от конфликтов"""
+    max_retries = 5
+    retry_delay = 10  # секунд
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Попытка запуска бота #{attempt + 1}")
+            
+            # Проверка обязательных переменных
+            token = os.getenv('TELEGRAM_TOKEN')
+            if not token:
+                raise ValueError("TELEGRAM_TOKEN не установен")
+            
+            # Проверка API ключей
+            if not os.getenv('OMDB_API_KEY') and not os.getenv('KINOPOISK_API_KEY'):
+                logger.warning("API ключи для поиска медиа не установлены")
+            
+            # Инициализация бота
+            application = Application.builder().token(token).build()
+            
+            # Регистрация обработчиков
+            application.add_handler(CommandHandler("start", start))
+            application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+            
+            # Запуск с увеличенным интервалом опроса
+            logger.info("Бот запущен...")
+            application.run_polling(
+                poll_interval=3.0,  # Увеличенный интервал
+                close_loop=False,
+                stop_signals=None
+            )
+            break  # Успешный запуск, выходим из цикла
+            
+        except telegram.error.Conflict as e:
+            logger.error(f"Конфликт обновлений: {e}")
+            if attempt < max_retries - 1:
+                logger.info(f"Повторная попытка через {retry_delay} секунд...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Экспоненциальная задержка
+            else:
+                logger.critical("Достигнуто максимальное количество попыток. Завершение работы.")
+                raise
+        except Exception as e:
+            logger.exception("Критическая ошибка при запуске")
+            raise
 
 if __name__ == '__main__':
     main()
