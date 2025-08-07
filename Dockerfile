@@ -1,17 +1,28 @@
-FROM python:3.10-slim
+FROM python:3.10-slim-bookworm
 
-# Устанавливаем рабочую директорию
 WORKDIR /app
 
-# Установка зависимостей с фиксацией версий пакетов
+# Установка базовых зависимостей
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    tesseract-ocr=5.1.0-1 \
-    tesseract-ocr-rus=1:5.1.0-1 \
-    tesseract-ocr-eng=1:5.1.0-1 \
-    tesseract-ocr-script-latn=1:5.1.0-1 \
-    tesseract-ocr-script-cyrl=1:5.1.0-1 \
-    tesseract-ocr-osd=1:5.1.0-1 \
+    wget \
+    gnupg2 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Добавление официального репозитория Tesseract 5
+RUN wget -qO- https://github.com/tesseract-ocr/tessdata/raw/main/eng.traineddata > /usr/share/tesseract-ocr/5/tessdata/eng.traineddata && \
+    wget -qO- https://github.com/tesseract-ocr/tessdata/raw/main/rus.traineddata > /usr/share/tesseract-ocr/5/tessdata/rus.traineddata && \
+    wget -qO- https://github.com/tesseract-ocr/tessdata/raw/main/osd.traineddata > /usr/share/tesseract-ocr/5/tessdata/osd.traineddata && \
+    wget -qO- https://github.com/tesseract-ocr/tessdata/raw/main/script/Latin.traineddata > /usr/share/tesseract-ocr/5/tessdata/script/Latin.traineddata && \
+    wget -qO- https://github.com/tesseract-ocr/tessdata/raw/main/script/Cyrillic.traineddata > /usr/share/tesseract-ocr/5/tessdata/script/Cyrillic.traineddata
+
+# Установка Tesseract и runtime-зависимостей
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    libtesseract-dev \
+    libleptonica-dev \
     libgl1-mesa-glx \
     libglib2.0-0 \
     libtiff5 \
@@ -21,12 +32,10 @@ RUN apt-get update && \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем зависимости и устанавливаем их
+# Установка Python зависимостей
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем исходный код
 COPY . .
 
-# Запускаем бота
 CMD ["python", "bot.py"]
