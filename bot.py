@@ -4,7 +4,9 @@ import tempfile
 import gc
 import re
 import requests
-from PIL import Image, ImageEnhance, ImageOps
+import cv2
+import numpy as np
+from PIL import Image, ImageEnhance, ImageOps, ImageFilter
 import pytesseract
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -21,62 +23,158 @@ OMDB_API_URL = "http://www.omdbapi.com/"
 KINOPOISK_API_URL = "https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword"
 
 def preprocess_image(image_path: str) -> Image.Image:
-    """Улучшает изображение для обработки OCR"""
+    """Улучшает изображение для обработки OCR с использованием OpenCV"""
     try:
-        with Image.open(image_path) as img:
-            # Уменьшаем размер
-            img.thumbnail((800, 800))
-            
-            # Конвертируем в Ч/Б и повышаем контрастность
+        # Загрузка изображения с помощью OpenCV
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError("Не удалось загрузить изображение")
+        
+        # Уменьшение размера
+        height, width = img.shape[:2]
+        max_dim = 1200
+        if max(height, width) > max_dim:
+            scale = max_dim / max(height, width)
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        
+        # Конвертация в серый
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Уменьшение шума
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        
+        # Адаптивная бинаризация
+        binary = cv2.adaptiveThreshold(
+            denoised, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 11, 2
+        )
+        
+        # Увеличение резкости
+        kernel = np.array([[-1, -1, -1], 
+                           [-1, 9, -1], 
+                           [-1, -1, -1]])
+        sharpened = cv2.filter2D(binary, -1, kernel)
+        
+        # Конвертация обратно в PIL Image
+        processed_img = Image.fromarray(sharpened)
+        return processed_img
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки изображения OpenCV: {e}")
+        # Fallback: простая обработка PIL
+        try:
+            img = Image.open(image_path)
+            img.thumbnail((1200, 1200))
             img = img.convert('L')
-            img = ImageOps.autocontrast(img, cutoff=5)
-            
-            # Улучшаем резкость
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(2.0)
             enhancer = ImageEnhance.Sharpness(img)
             img = enhancer.enhance(2.0)
-            
             return img
-    except Exception as e:
-        logger.error(f"Ошибка обработки изображения: {e}")
-        return None
+        except Exception as e2:
+            logger.error(f"Ошибка обработки изображения PIL: {e2}")
+            return None
 
 def extract_text_with_tesseract(image: Image.Image) -> str:
-    """Извлекает текст с изображения через Tesseract OCR"""
+    """Извлекает текст с изображения через Tesseract OCR с улучшениями"""
     try:
-        # Пробуем разные конфигурации для улучшения распознавания
+        # Множественные попытки с разными параметрами
         configs = [
             r'--oem 3 --psm 6 -l eng+rus',
             r'--oem 3 --psm 11 -l eng+rus',
-            r'--oem 3 --psm 4 -l eng+rus'
+            r'--oem 3 --psm 4 -l eng+rus',
+            r'--oem 1 --psm 7 -l eng+rus'
         ]
         
         best_text = ""
+        best_score = 0
+        
         for config in configs:
             text = pytesseract.image_to_string(image, config=config).strip()
-            # Выбираем наиболее вероятный результат
-            if len(text) > len(best_text) and any(c.isalpha() for c in text):
+            if not text:
+                continue
+                
+            # Оценка качества текста
+            score = sum(1 for char in text if char.isalnum() or char.isspace())
+            if score > best_score:
                 best_text = text
+                best_score = score
                 
         return best_text
     except Exception as e:
         logger.error(f"Ошибка Tesseract OCR: {e}")
         return ""
 
+def extract_text_regions(image_path: str) -> str:
+    """Выделяет области с текстом и распознаёт их отдельно"""
+    try:
+        # Загрузка изображения
+        img = cv2.imread(image_path)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Детекция текста
+        text_regions = []
+        
+        # Метод 1: MSER
+        mser = cv2.MSER_create()
+        regions, _ = mser.detectRegions(gray)
+        
+        for region in regions:
+            x, y, w, h = cv2.boundingRect(region.reshape(-1, 1, 2))
+            if w > 20 and h > 10:  # Фильтр маленьких областей
+                text_regions.append((x, y, x + w, y + h))
+        
+        # Если не найдено регионов, попробуем другой метод
+        if not text_regions:
+            # Метод 2: Контуры
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edged = cv2.Canny(blurred, 50, 150)
+            contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                if cv2.contourArea(contour) > 100:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    text_regions.append((x, y, x + w, y + h))
+        
+        # Распознавание текста в регионах
+        combined_text = []
+        for (x1, y1, x2, y2) in text_regions:
+            # Увеличиваем область для контекста
+            padding = 10
+            x1 = max(0, x1 - padding)
+            y1 = max(0, y1 - padding)
+            x2 = min(img.shape[1], x2 + padding)
+            y2 = min(img.shape[0], y2 + padding)
+            
+            roi = img[y1:y2, x1:x2]
+            roi_pil = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+            text = pytesseract.image_to_string(roi_pil, config=r'--oem 3 --psm 7 -l eng+rus').strip()
+            
+            if text:
+                combined_text.append(text)
+        
+        return "\n".join(combined_text)
+        
+    except Exception as e:
+        logger.error(f"Ошибка выделения текстовых регионов: {e}")
+        return ""
+
 def is_valid_title(text: str) -> bool:
     """Проверяет, похож ли текст на название фильма"""
     # Минимум 3 символа, содержащих буквы
-    if len(text) < 3:
-        return False
-        
-    # Проверяем наличие букв
-    if not any(char.isalpha() for char in text):
+    if len(text) < 3 or not any(char.isalpha() for char in text):
         return False
         
     # Исключаем случайные комбинации символов
     invalid_patterns = [
-        r'^[0-9\W]+$',  # Только цифры и символы
-        r'^[a-z]{1,2}\s*=\s*[a-z]{1,2}$',  # Пример: "a = b"
-        r'http[s]?://'  # URL
+        r'^[\W\d]+$',  # Только цифры и символы
+        r'^[a-z]{1,2}\s*[\W]?\s*[a-z]{1,2}$',  # Пример: "a b" или "a=b"
+        r'http[s]?://',  # URL
+        r'\d{1,2}[:;]\d{2}',  # Время (10:30)
+        r'\d{1,2}/\d{1,2}/\d{2,4}',  # Дата
+        r'[0-9]{3,}',  # Много цифр
+        r'[^a-zа-я0-9]{4,}',  # Много спецсимволов подряд
     ]
     
     for pattern in invalid_patterns:
@@ -91,76 +189,86 @@ def clean_title(text: str) -> str:
     cleaned = re.sub(r'[^\w\s\-:.,!?\'"]', '', text, flags=re.UNICODE)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     
-    # Берем первую строку или первые 4 слова
+    # Выбираем наиболее вероятную строку
     lines = cleaned.split('\n')
-    if lines:
-        words = lines[0].split()[:4]
-        return ' '.join(words)
-        
-    return cleaned
-
-def search_omdb(title: str) -> dict:
-    """Поиск через OMDb API"""
-    try:
-        params = {
-            'apikey': os.getenv('OMDB_API_KEY'),
-            't': title,
-            'type': 'movie,series,episode',
-            'plot': 'short',
-            'r': 'json'
-        }
-        response = requests.get(OMDB_API_URL, params=params, timeout=15)
-        data = response.json()
-        return data if data.get('Response') == 'True' else {}
-    except Exception as e:
-        logger.error(f"Ошибка OMDb API: {e}")
-        return {}
-
-def search_kinopoisk(title: str) -> dict:
-    """Поиск через Kinopoisk Unofficial API"""
-    try:
-        headers = {'X-API-KEY': os.getenv('KINOPOISK_API_KEY')}
-        params = {'keyword': title}
-        
-        response = requests.get(
-            KINOPOISK_API_URL,
-            headers=headers,
-            params=params,
-            timeout=15
-        )
-        data = response.json()
-        return data['films'][0] if data.get('films') else {}
-    except Exception as e:
-        logger.error(f"Ошибка Kinopoisk API: {e}")
-        return {}
-
-def convert_kinopoisk_to_omdb(kinopoisk_data: dict) -> dict:
-    """Конвертирует данные Kinopoisk в формат OMDb"""
-    return {
-        'Title': kinopoisk_data.get('nameRu') or kinopoisk_data.get('nameEn', ''),
-        'Year': kinopoisk_data.get('year', 'N/A'),
-        'Type': 'movie',
-        'Plot': kinopoisk_data.get('description', 'Описание отсутствует'),
-        'Poster': kinopoisk_data.get('posterUrl', ''),
-        'imdbRating': kinopoisk_data.get('rating', 'N/A'),
-        'Runtime': 'N/A',
-        'Response': 'True',
-        'Genre': ', '.join(genre['genre'] for genre in kinopoisk_data.get('genres', [])),
-        'Director': next((p['name'] for p in kinopoisk_data.get('staff', []) 
-                         if p.get('professionKey') == 'DIRECTOR'), 'N/A'),
-        'imdbID': f"kp{kinopoisk_data.get('filmId', '')}"
-    } if kinopoisk_data else {}
+    if not lines:
+        return cleaned
+    
+    # Сортируем строки по количеству букв
+    lines.sort(key=lambda line: sum(1 for c in line if c.isalpha()), reverse=True)
+    best_line = lines[0]
+    
+    # Берем первые 3-5 слов
+    words = best_line.split()
+    if len(words) > 5:
+        return ' '.join(words[:5])
+    return best_line
 
 def search_media(title: str) -> dict:
-    """Поиск медиа через API"""
-    # Пробуем OMDb первым
-    omdb_result = search_omdb(title)
-    if omdb_result:
-        return omdb_result
+    """Поиск медиа через API с несколькими попытками"""
+    if not title:
+        return {}
     
-    # Если OMDb не дал результатов, пробуем Kinopoisk
-    kinopoisk_result = search_kinopoisk(title)
-    return convert_kinopoisk_to_omdb(kinopoisk_result)
+    # Попробуем разные варианты запросов
+    search_attempts = [
+        title,
+        re.sub(r'[^\w\s]', '', title),  # Без пунктуации
+        ' '.join(title.split()[:3]),     # Первые 3 слова
+        ' '.join(title.split()[-3:]),    # Последние 3 слова
+    ]
+    
+    # Удаляем дубликаты
+    search_attempts = list(dict.fromkeys(search_attempts))
+    
+    for attempt in search_attempts:
+        # Попробуем OMDb
+        try:
+            params = {
+                'apikey': os.getenv('OMDB_API_KEY'),
+                't': attempt,
+                'type': 'movie,series,episode',
+                'plot': 'short',
+                'r': 'json'
+            }
+            response = requests.get(OMDB_API_URL, params=params, timeout=15)
+            data = response.json()
+            if data.get('Response') == 'True':
+                return data
+        except Exception:
+            pass
+        
+        # Попробуем Kinopoisk
+        try:
+            headers = {'X-API-KEY': os.getenv('KINOPOISK_API_KEY')}
+            params = {'keyword': attempt}
+            
+            response = requests.get(
+                KINOPOISK_API_URL,
+                headers=headers,
+                params=params,
+                timeout=15
+            )
+            data = response.json()
+            if data.get('films'):
+                film = data['films'][0]
+                return {
+                    'Title': film.get('nameRu') or film.get('nameEn', ''),
+                    'Year': film.get('year', 'N/A'),
+                    'Type': 'movie',
+                    'Plot': film.get('description', 'Описание отсутствует'),
+                    'Poster': film.get('posterUrl', ''),
+                    'imdbRating': film.get('rating', 'N/A'),
+                    'Runtime': 'N/A',
+                    'Response': 'True',
+                    'Genre': ', '.join(genre['genre'] for genre in film.get('genres', [])),
+                    'Director': next((p['name'] for p in film.get('staff', []) 
+                                    if p.get('professionKey') == 'DIRECTOR'), 'N/A'),
+                    'imdbID': f"kp{film.get('filmId', '')}"
+                }
+        except Exception:
+            pass
+    
+    return {}
 
 def format_media_info(media_data: dict) -> str:
     """Форматирует информацию о медиа-контенте"""
@@ -178,7 +286,9 @@ def format_media_info(media_data: dict) -> str:
     # Форматирование ответа
     info = f"🎬 <b>{title}</b> ({year})"
     info += f"\n📀 Тип: {media_type}"
-    info += f"\n🎭 Жанр: {genre}"
+    
+    if genre != 'N/A':
+        info += f"\n🎭 Жанр: {genre}"
     
     if director != 'N/A':
         info += f"\n🎥 Режиссер: {director}"
@@ -208,10 +318,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             f"Привет, {user.mention_html()}! Отправь мне скриншот из фильма/сериала, "
             "и я найду информацию о нём!\n\n"
-            "Советы для лучшего распознавания:\n"
-            "1. Выбирайте кадры с четким текстом (названия, титры)\n"
-            "2. Избегайте слишком темных или светлых изображений\n"
-            "3. Кадрируйте изображение, чтобы текст занимал центральную часть",
+            "📌 Советы для лучшего распознавания:\n"
+            "1. Выбирайте кадры с чёткими надписями (титры, названия)\n"
+            "2. Избегайте слишком тёмных или светлых изображений\n"
+            "3. Обрезайте изображение, чтобы текст был в центре\n"
+            "4. Идеальные кадры: начальные/конечные титры, экраны с названием\n\n"
+            "Если автоматическое распознавание не сработает, попробуйте отправить "
+            "название фильма текстовым сообщением.",
             parse_mode='HTML'
         )
     except Exception as e:
@@ -230,16 +343,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             temp_file_path = temp_file.name
             logger.info(f"Фото сохранено: {temp_file_path}")
             
-            # Предобработка и OCR
+            # Предобработка и OCR - попробуем два метода
             processed_img = preprocess_image(temp_file_path)
             if not processed_img:
                 await update.message.reply_text("❌ Ошибка обработки изображения")
                 return
                 
+            # Метод 1: Обычное распознавание
             raw_text = extract_text_with_tesseract(processed_img)
             
+            # Метод 2: Выделение текстовых областей (если первый метод не дал результата)
             if not raw_text or not any(c.isalpha() for c in raw_text):
-                await update.message.reply_text("❌ Не удалось распознать текст на изображении")
+                region_text = extract_text_regions(temp_file_path)
+                if region_text:
+                    raw_text = region_text
+            
+            if not raw_text or not any(c.isalpha() for c in raw_text):
+                await update.message.reply_text(
+                    "❌ Не удалось распознать текст на изображении\n"
+                    "Попробуйте:\n"
+                    "• Отправить другой кадр\n"
+                    "• Выбрать изображение с более чётким текстом\n"
+                    "• Отправить название фильма текстовым сообщением"
+                )
                 return
                 
             # Очистка и проверка названия
@@ -247,8 +373,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             
             if not is_valid_title(cleaned_text):
                 await update.message.reply_text(
-                    f"❌ Распознанный текст не похож на название фильма: {cleaned_text}\n"
-                    "Попробуйте другое изображение с четким текстом"
+                    f"❌ Распознанный текст не похож на название фильма: «{cleaned_text}»\n"
+                    "Попробуйте отправить другой кадр или ввести название вручную"
                 )
                 return
                 
@@ -262,7 +388,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
     except Exception as e:
         logger.error(f"Ошибка обработки фото: {e}")
-        await update.message.reply_text("⚠️ Произошла ошибка при обработке изображения")
+        await update.message.reply_text(
+            "⚠️ Произошла ошибка при обработке изображения\n"
+            "Попробуйте отправить другой кадр или название фильма текстом"
+        )
     finally:
         # Очистка временных файлов
         if temp_file_path and os.path.exists(temp_file_path):
@@ -272,15 +401,39 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 logger.error(f"Ошибка удаления временного файла: {e}")
         gc.collect()
 
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик текстовых сообщений (ручной ввод названия)"""
+    try:
+        text = update.message.text.strip()
+        if not text:
+            await update.message.reply_text("Пожалуйста, введите название фильма")
+            return
+            
+        # Ограничение длины
+        if len(text) > 100:
+            text = text[:100]
+            
+        logger.info(f"Поиск по ручному вводу: {text}")
+        await update.message.reply_text(f"🔍 Ищем: «{text}»")
+        
+        # Поиск информации
+        media_data = search_media(text)
+        response = format_media_info(media_data)
+        await update.message.reply_text(response, parse_mode='HTML')
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки текста: {e}")
+        await update.message.reply_text("⚠️ Произошла ошибка при поиске информации")
+
 def main() -> None:
     """Запуск бота"""
     try:
-        logger.info("Запуск оптимизированного бота...")
+        logger.info("Запуск улучшенного бота...")
         
         # Проверка обязательных переменных
         token = os.getenv('TELEGRAM_TOKEN')
         if not token:
-            raise ValueError("TELEGRAM_TOKEN не установлен")
+            raise ValueError("TELEGRAM_TOKEN не установен")
         
         # Проверка API ключей
         if not os.getenv('OMDB_API_KEY') and not os.getenv('KINOPOISK_API_KEY'):
@@ -292,6 +445,7 @@ def main() -> None:
         # Регистрация обработчиков
         application.add_handler(CommandHandler("start", start))
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
         
         # Запуск
         logger.info("Бот запущен...")
