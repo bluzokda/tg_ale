@@ -1,16 +1,17 @@
 FROM python:3.10-slim
 
+# Устанавливаем рабочую директорию
 WORKDIR /app
 
-# Установка минимальных зависимостей
+# Установка зависимостей с фиксацией версий пакетов
 RUN apt-get update && \
-    apt-get install -y \
-    tesseract-ocr \
-    tesseract-ocr-rus \
-    tesseract-ocr-eng \
-    tesseract-ocr-script-latn \
-    tesseract-ocr-script-cyrl \
-    tesseract-ocr-osd \
+    apt-get install -y --no-install-recommends \
+    tesseract-ocr=5.1.0-1 \
+    tesseract-ocr-rus=1:5.1.0-1 \
+    tesseract-ocr-eng=1:5.1.0-1 \
+    tesseract-ocr-script-latn=1:5.1.0-1 \
+    tesseract-ocr-script-cyrl=1:5.1.0-1 \
+    tesseract-ocr-osd=1:5.1.0-1 \
     libgl1-mesa-glx \
     libglib2.0-0 \
     libtiff5 \
@@ -20,16 +21,12 @@ RUN apt-get update && \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Установка последней версии Tesseract и языковых данных
-RUN apt-get update && \
-    apt-get install -y apt-transport-https gnupg2 && \
-    echo "deb https://notesalexp.org/tesseract-ocr5/$(lsb_release -cs)/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/notesalexp.list && \
-    apt-get update -oAcquire::AllowInsecureRepositories=true && \
-    apt-get install -y --allow-unauthenticated tesseract-ocr tesseract-ocr-osd tesseract-ocr-eng tesseract-ocr-rus
-
+# Копируем зависимости и устанавливаем их
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Копируем исходный код
 COPY . .
 
+# Запускаем бота
 CMD ["python", "bot.py"]
