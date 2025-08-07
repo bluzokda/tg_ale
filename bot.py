@@ -4,8 +4,15 @@ import tempfile
 import subprocess
 import gc
 import sys
+import re
+import sqlite3
+import torch
+import clip
 from urllib.parse import urlparse
+from PIL import Image, ImageEnhance
+import numpy as np
 
+import pytesseract
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from pytube import YouTube
@@ -22,7 +29,85 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация API
 OMDB_API_URL = "http://www.omdbapi.com/"
-CORTOS_API_URL = "https://api.cortos.xyz/v1/recognize"
+KINOPOISK_API_URL = "https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword"
+
+# Инициализация кэша
+def init_db():
+    conn = sqlite3.connect('cache.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS requests
+                 (hash TEXT PRIMARY KEY, response TEXT)''')
+    conn.commit()
+    return conn
+
+DB_CONN = init_db()
+
+# Глобальные переменные для CLIP
+CLIP_MODEL = None
+CLIP_PREPROCESS = None
+CLIP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MOVIE_DATABASE = []  # Здесь будут храниться названия фильмов
+
+def init_clip():
+    """Инициализирует модель CLIP один раз при запуске"""
+    global CLIP_MODEL, CLIP_PREPROCESS, MOVIE_DATABASE
+    try:
+        logger.info(f"Загрузка модели CLIP на устройство: {CLIP_DEVICE}")
+        CLIP_MODEL, CLIP_PREPROCESS = clip.load("ViT-B/32", device=CLIP_DEVICE)
+        
+        # Загрузка базы названий фильмов (упрощенный вариант)
+        MOVIE_DATABASE = [
+            "The Matrix", "Inception", "Interstellar", "Avatar", "Titanic",
+            "Pulp Fiction", "Fight Club", "Forrest Gump", "The Shawshank Redemption",
+            "The Godfather", "The Dark Knight", "Schindler's List", "Star Wars"
+        ]
+        logger.info(f"CLIP инициализирован, база: {len(MOVIE_DATABASE)} фильмов")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации CLIP: {e}")
+
+def preprocess_image(image_path: str) -> Image:
+    """Улучшает изображение для обработки"""
+    img = Image.open(image_path)
+    # Увеличиваем контраст
+    img = ImageEnhance.Contrast(img).enhance(1.5)
+    # Увеличиваем резкость
+    img = ImageEnhance.Sharpness(img).enhance(1.2)
+    return img
+
+def detect_with_clip(image_path: str) -> str:
+    """Определяет фильм с помощью CLIP"""
+    if not CLIP_MODEL:
+        return ""
+    
+    try:
+        # Предобработка изображения
+        image = preprocess_image(image_path)
+        image_input = CLIP_PREPROCESS(image).unsqueeze(0).to(CLIP_DEVICE)
+        
+        # Подготовка текстовых запросов
+        text_inputs = torch.cat([
+            clip.tokenize(f"a scene from {movie}") for movie in MOVIE_DATABASE
+        ]).to(CLIP_DEVICE)
+        
+        # Расчет вероятностей
+        with torch.no_grad():
+            image_features = CLIP_MODEL.encode_image(image_input)
+            text_features = CLIP_MODEL.encode_text(text_inputs)
+            
+            # Вычисляем сходство
+            logits_per_image, _ = CLIP_MODEL(image_input, text_inputs)
+            probs = logits_per_image.softmax(dim=-1).cpu().numpy()
+        
+        # Находим лучший результат
+        best_idx = np.argmax(probs)
+        best_movie = MOVIE_DATABASE[best_idx]
+        confidence = probs[0][best_idx]
+        
+        logger.info(f"CLIP: {best_movie} (уверенность: {confidence:.2f})")
+        return best_movie if confidence > 0.3 else ""
+    except Exception as e:
+        logger.error(f"Ошибка CLIP: {e}")
+        return ""
 
 def check_ffmpeg():
     """Проверяет доступность ffmpeg в системе"""
@@ -72,6 +157,17 @@ def extract_frame(video_path: str, timestamp: int = 5) -> str:
         logger.error(f"Ошибка извлечения кадра: {e}")
         raise
 
+def extract_text_with_tesseract(image_path: str) -> str:
+    """Извлекает текст с изображения через Tesseract OCR"""
+    try:
+        image = preprocess_image(image_path)
+        custom_config = r'--oem 3 --psm 6'
+        text = pytesseract.image_to_string(image, config=custom_config, lang='eng+rus')
+        return text.strip()
+    except Exception as e:
+        logger.error(f"Ошибка Tesseract OCR: {e}")
+        return ""
+
 def detect_with_google_vision(image_path: str) -> str:
     """Анализирует изображение через Google Vision API"""
     try:
@@ -84,85 +180,52 @@ def detect_with_google_vision(image_path: str) -> str:
         response = client.web_detection(image=image)
         web_detection = response.web_detection
         
-        # Собираем все возможные текстовые описания
-        candidates = []
+        # Фильтруем результаты (только фильмы/сериалы)
+        valid_results = []
+        pattern = re.compile(r"(фильм|сериал|кин[оа]|movie|series|tv show|episode)", re.I)
         
-        # Лучшая догадка
-        if web_detection.best_guess_labels:
-            candidates.append(web_detection.best_guess_labels[0].label)
-            
-        # Веб-сущности с высоким доверием
+        # Веб-сущности
         if web_detection.web_entities:
             for entity in web_detection.web_entities:
-                if entity.description and entity.score > 0.7:
-                    candidates.append(entity.description)
+                if entity.description and pattern.search(entity.description):
+                    valid_results.append(entity.description)
         
-        # URL совпадающих изображений (может содержать названия в URL)
-        if web_detection.full_matching_images:
-            for img in web_detection.full_matching_images:
-                if img.url:
-                    # Извлекаем возможное название из URL
-                    parsed = urlparse(img.url)
-                    # Берем последнюю часть пути
-                    path_part = parsed.path.split('/')[-1]
-                    if path_part:
-                        candidates.append(path_part.replace('-', ' '))
-        
-        # Страницы с совпадающими изображениями
+        # Страницы с изображениями
         if web_detection.pages_with_matching_images:
             for page in web_detection.pages_with_matching_images:
-                if page.url:
-                    parsed = urlparse(page.url)
-                    path_part = parsed.path.split('/')[-1]
-                    if path_part:
-                        candidates.append(path_part.replace('-', ' '))
-                if page.page_title:
-                    candidates.append(page.page_title)
+                if page.page_title and pattern.search(page.page_title):
+                    valid_results.append(page.page_title)
         
-        return ", ".join(candidates) if candidates else ""
+        return ", ".join(set(valid_results)) if valid_results else ""
     except Exception as e:
         logger.error(f"Ошибка Google Vision: {e}")
         return ""
 
-def recognize_with_cortos(image_path: str) -> str:
-    """Распознает фильм через Cortos API (специализированный ИИ)"""
-    try:
-        headers = {"Authorization": f"Bearer {os.getenv('CORTOS_API_KEY')}"}
-        
-        with open(image_path, 'rb') as img_file:
-            files = {'image': img_file}
-            response = requests.post(CORTOS_API_URL, headers=headers, files=files, timeout=15)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('matches'):
-                # Берем самый лучший результат
-                return data['matches'][0]['title']
-        return ""
-    except Exception as e:
-        logger.error(f"Ошибка Cortos API: {e}")
-        return ""
-
 def detect_content(image_path: str) -> str:
-    """Основная функция распознавания: комбинация Vision + Cortos"""
-    # Сначала пробуем Google Vision
+    """Основная функция распознавания: Vision → CLIP → Tesseract"""
+    # Пробуем Google Vision
     vision_result = detect_with_google_vision(image_path)
     if vision_result:
         logger.info(f"Google Vision распознал: {vision_result}")
         return vision_result
     
-    # Если Vision не дал результата, используем Cortos
-    cortos_result = recognize_with_cortos(image_path)
-    if cortos_result:
-        logger.info(f"Cortos распознал: {cortos_result}")
-        return cortos_result
+    # Пробуем CLIP
+    clip_result = detect_with_clip(image_path)
+    if clip_result:
+        logger.info(f"CLIP распознал: {clip_result}")
+        return clip_result
+    
+    # Fallback: Tesseract OCR
+    tesseract_result = extract_text_with_tesseract(image_path)
+    if tesseract_result:
+        logger.info(f"Tesseract распознал: {tesseract_result}")
+        return tesseract_result
     
     return ""
 
-def search_media(title: str) -> dict:
-    """Ищет медиа-контент через OMDb API"""
+def search_omdb(title: str) -> dict:
+    """Поиск через OMDb API"""
     try:
-        # Пробуем несколько кандидатов, если их несколько
         titles = [t.strip() for t in title.split(',')] if ',' in title else [title]
         
         for t in titles:
@@ -170,10 +233,9 @@ def search_media(title: str) -> dict:
                 'apikey': os.getenv('OMDB_API_KEY'),
                 't': t,
                 'type': 'movie,series,episode',
-                'plot': 'short'
+                'plot': 'short',
+                'r': 'json'
             }
-            
-            logger.info(f"Поиск медиа для: {t}")
             response = requests.get(OMDB_API_URL, params=params, timeout=10)
             data = response.json()
             
@@ -182,8 +244,68 @@ def search_media(title: str) -> dict:
         
         return {}
     except Exception as e:
-        logger.error(f"Ошибка поиска медиа: {e}")
+        logger.error(f"Ошибка OMDb API: {e}")
         return {}
+
+def search_kinopoisk(title: str) -> dict:
+    """Поиск через Kinopoisk Unofficial API"""
+    try:
+        headers = {
+            'X-API-KEY': os.getenv('KINOPOISK_API_KEY'),
+            'Content-Type': 'application/json'
+        }
+        params = {'keyword': title}
+        
+        response = requests.get(
+            KINOPOISK_API_URL,
+            headers=headers,
+            params=params,
+            timeout=10
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        if data.get('films'):
+            return data['films'][0]  # Берем первый результат
+        
+        return {}
+    except Exception as e:
+        logger.error(f"Ошибка Kinopoisk API: {e}")
+        return {}
+
+def convert_kinopoisk_to_omdb(kinopoisk_data: dict) -> dict:
+    """Конвертирует данные Kinopoisk в формат, похожий на OMDb"""
+    return {
+        'Title': kinopoisk_data.get('nameRu') or kinopoisk_data.get('nameEn', ''),
+        'Year': kinopoisk_data.get('year', 'N/A'),
+        'Type': 'movie',  # Kinopoisk API не различает типы
+        'Plot': kinopoisk_data.get('description', 'Описание отсутствует'),
+        'Poster': kinopoisk_data.get('posterUrl', ''),
+        'imdbRating': kinopoisk_data.get('rating', 'N/A'),
+        'Runtime': 'N/A',
+        'Response': 'True',
+        # Дополнительные поля для совместимости
+        'Genre': ', '.join(kinopoisk_data.get('genres', [])),
+        'Director': ', '.join([p['name'] for p in kinopoisk_data.get('staff', []) 
+                              if p.get('professionKey') == 'DIRECTOR']),
+        'Actors': ', '.join([p['name'] for p in kinopoisk_data.get('staff', [])
+                            if p.get('professionKey') in ['ACTOR', 'HIMSELF']]),
+        'imdbID': f"kp{kinopoisk_data.get('filmId', '')}"
+    }
+
+def search_media(title: str) -> dict:
+    """Поиск медиа через OMDb + Kinopoisk"""
+    # Пробуем OMDb первым
+    omdb_result = search_omdb(title)
+    if omdb_result and omdb_result.get('Response') == 'True':
+        return omdb_result
+    
+    # Если OMDb не дал результатов, пробуем Kinopoisk
+    kinopoisk_result = search_kinopoisk(title)
+    if kinopoisk_result:
+        return convert_kinopoisk_to_omdb(kinopoisk_result)
+    
+    return {}
 
 def format_media_info(media_data: dict) -> str:
     """Форматирует информацию о медиа-контенте"""
@@ -338,16 +460,19 @@ def main() -> None:
             logger.critical("FFmpeg недоступен! Завершение работы.")
             return
         
+        # Инициализация CLIP
+        init_clip()
+        
         # Загрузка переменных окружения
         token = os.getenv('TELEGRAM_TOKEN')
         if not token:
             raise ValueError("TELEGRAM_TOKEN не установлен")
         
         # Проверка API ключей
-        if not os.getenv('OMDB_API_KEY'):
-            logger.warning("OMDB_API_KEY не установлен! Поиск медиа будет недоступен")
-        if not os.getenv('CORTOS_API_KEY'):
-            logger.warning("CORTOS_API_KEY не установлен! Cortos распознавание недоступно")
+        if not os.getenv('OMDB_API_KEY') and not os.getenv('KINOPOISK_API_KEY'):
+            logger.warning("API ключи для поиска медиа не установлены! Поиск будет недоступен")
+        if not os.getenv('GOOGLE_APPLICATION_CREDENTIALS'):
+            logger.warning("Google Vision недоступен без учетных данных")
         
         # Инициализация бота
         application = Application.builder().token(token).build()
