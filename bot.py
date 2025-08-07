@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация API
 OMDB_API_URL = "http://www.omdbapi.com/"
+CORTOS_API_URL = "https://api.cortos.xyz/v1/recognize"
 
 def check_ffmpeg():
     """Проверяет доступность ffmpeg в системе"""
@@ -71,7 +72,7 @@ def extract_frame(video_path: str, timestamp: int = 5) -> str:
         logger.error(f"Ошибка извлечения кадра: {e}")
         raise
 
-def detect_content(image_path: str) -> str:
+def detect_with_google_vision(image_path: str) -> str:
     """Анализирует изображение через Google Vision API"""
     try:
         client = vision.ImageAnnotatorClient()
@@ -80,52 +81,105 @@ def detect_content(image_path: str) -> str:
             content = image_file.read()
         
         image = vision.Image(content=content)
-        
-        # Улучшенное распознавание с фокусировкой на медиа-контенте
         response = client.web_detection(image=image)
         web_detection = response.web_detection
         
-        # Приоритет для лучших совпадений и веб-сущностей
-        best_guess = ""
-        if web_detection.best_guess_labels:
-            best_guess = web_detection.best_guess_labels[0].label
+        # Собираем все возможные текстовые описания
+        candidates = []
         
-        # Собираем все релевантные описания
-        descriptions = set()
-        if best_guess:
-            descriptions.add(best_guess)
+        # Лучшая догадка
+        if web_detection.best_guess_labels:
+            candidates.append(web_detection.best_guess_labels[0].label)
             
+        # Веб-сущности с высоким доверием
         if web_detection.web_entities:
             for entity in web_detection.web_entities:
                 if entity.description and entity.score > 0.7:
-                    descriptions.add(entity.description)
+                    candidates.append(entity.description)
         
-        # Фильтруем результаты для медиа-контента
-        media_keywords = {"movie", "film", "tv", "series", "episode", "show", "scene"}
-        filtered = [desc for desc in descriptions 
-                   if any(kw in desc.lower() for kw in media_keywords)]
+        # URL совпадающих изображений (может содержать названия в URL)
+        if web_detection.full_matching_images:
+            for img in web_detection.full_matching_images:
+                if img.url:
+                    # Извлекаем возможное название из URL
+                    parsed = urlparse(img.url)
+                    # Берем последнюю часть пути
+                    path_part = parsed.path.split('/')[-1]
+                    if path_part:
+                        candidates.append(path_part.replace('-', ' '))
         
-        return filtered[0] if filtered else best_guess
+        # Страницы с совпадающими изображениями
+        if web_detection.pages_with_matching_images:
+            for page in web_detection.pages_with_matching_images:
+                if page.url:
+                    parsed = urlparse(page.url)
+                    path_part = parsed.path.split('/')[-1]
+                    if path_part:
+                        candidates.append(path_part.replace('-', ' '))
+                if page.page_title:
+                    candidates.append(page.page_title)
+        
+        return ", ".join(candidates) if candidates else ""
     except Exception as e:
-        logger.error(f"Ошибка распознавания контента: {e}")
+        logger.error(f"Ошибка Google Vision: {e}")
         return ""
+
+def recognize_with_cortos(image_path: str) -> str:
+    """Распознает фильм через Cortos API (специализированный ИИ)"""
+    try:
+        headers = {"Authorization": f"Bearer {os.getenv('CORTOS_API_KEY')}"}
+        
+        with open(image_path, 'rb') as img_file:
+            files = {'image': img_file}
+            response = requests.post(CORTOS_API_URL, headers=headers, files=files, timeout=15)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('matches'):
+                # Берем самый лучший результат
+                return data['matches'][0]['title']
+        return ""
+    except Exception as e:
+        logger.error(f"Ошибка Cortos API: {e}")
+        return ""
+
+def detect_content(image_path: str) -> str:
+    """Основная функция распознавания: комбинация Vision + Cortos"""
+    # Сначала пробуем Google Vision
+    vision_result = detect_with_google_vision(image_path)
+    if vision_result:
+        logger.info(f"Google Vision распознал: {vision_result}")
+        return vision_result
+    
+    # Если Vision не дал результата, используем Cortos
+    cortos_result = recognize_with_cortos(image_path)
+    if cortos_result:
+        logger.info(f"Cortos распознал: {cortos_result}")
+        return cortos_result
+    
+    return ""
 
 def search_media(title: str) -> dict:
     """Ищет медиа-контент через OMDb API"""
     try:
-        params = {
-            'apikey': os.getenv('OMDB_API_KEY'),
-            't': title,
-            'type': 'movie,series,episode',
-            'plot': 'short'
-        }
+        # Пробуем несколько кандидатов, если их несколько
+        titles = [t.strip() for t in title.split(',')] if ',' in title else [title]
         
-        logger.info(f"Поиск медиа для: {title}")
-        response = requests.get(OMDB_API_URL, params=params, timeout=10)
-        data = response.json()
+        for t in titles:
+            params = {
+                'apikey': os.getenv('OMDB_API_KEY'),
+                't': t,
+                'type': 'movie,series,episode',
+                'plot': 'short'
+            }
+            
+            logger.info(f"Поиск медиа для: {t}")
+            response = requests.get(OMDB_API_URL, params=params, timeout=10)
+            data = response.json()
+            
+            if data.get('Response') == 'True':
+                return data
         
-        if data.get('Response') == 'True':
-            return data
         return {}
     except Exception as e:
         logger.error(f"Ошибка поиска медиа: {e}")
@@ -289,9 +343,11 @@ def main() -> None:
         if not token:
             raise ValueError("TELEGRAM_TOKEN не установлен")
         
-        # Проверка OMDb API ключа
+        # Проверка API ключей
         if not os.getenv('OMDB_API_KEY'):
             logger.warning("OMDB_API_KEY не установлен! Поиск медиа будет недоступен")
+        if not os.getenv('CORTOS_API_KEY'):
+            logger.warning("CORTOS_API_KEY не установлен! Cortos распознавание недоступно")
         
         # Инициализация бота
         application = Application.builder().token(token).build()
