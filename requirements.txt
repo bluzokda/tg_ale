@@ -1,9 +1,5 @@
-python-telegram-bot[ext]==20.6
-pytube==15.0.0
-google-cloud-vision==3.4.5
+python-telegram-bot==20.6
 requests==2.31.0
-ffmpeg-python==0.2.0
-python-dotenv==1.0.0
 pytesseract==0.3.10
 pillow==10.1.0
-numpy==1.24.3
+python-dotenv==1.0.0
