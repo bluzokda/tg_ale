@@ -2,6 +2,5 @@ python-telegram-bot==20.6
 requests==2.31.0
 pytesseract==0.3.10
 pillow==10.1.0
-python-dotenv==1.0.0
 opencv-python-headless==4.9.0.80
-numpy==1.26.4  # Обновлено до последней версии
+numpy==1.26.4
