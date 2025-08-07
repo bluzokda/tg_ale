@@ -114,10 +114,11 @@ def process_video(url: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /start"""
     user = update.effective_user
-    await update.message.reply_markdown_v2(
-        f"Привет {user.mention_markdown_v2()}\! Отправь мне ссылку на YouTube видео, "
-        "и я попробую определить что это за фильм или сериал!"
-    )
+    await update.message.reply_text(
+    f"Привет, {user.mention_html()}! Отправь мне ссылку на YouTube видео, "
+    "и я попробую определить что это за фильм или сериал!",
+    parse_mode='HTML'
+)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик текстовых сообщений"""
@@ -141,6 +142,23 @@ def main() -> None:
     
     # Инициализация бота
     application = Application.builder().token(token).build()
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        url = update.message.text
+        parsed_url = urlparse(url)
+        
+        if not parsed_url.scheme or not parsed_url.netloc:
+            await update.message.reply_text("Пожалуйста, отправьте действительную URL-ссылку")
+            return
+        
+        await update.message.reply_text("🔍 Анализирую видео...")
+        result = process_video(url)
+        await update.message.reply_text(result or "Не удалось определить контент")
+    
+    except Exception as e:
+        logger.error(f"Ошибка в handle_message: {e}")
+        await update.message.reply_text("⚠️ Произошла ошибка при обработке запроса")
     
     # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
