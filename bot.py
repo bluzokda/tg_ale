@@ -4,7 +4,7 @@ import tempfile
 from urllib.parse import urlparse
 
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from pytube import YouTube
 from google.cloud import vision
 import requests
@@ -111,26 +111,26 @@ def process_video(url: str) -> str:
             if path and os.path.exists(path):
                 os.unlink(path)
 
-def start(update: Update, context: CallbackContext) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /start"""
     user = update.effective_user
-    update.message.reply_markdown_v2(
+    await update.message.reply_markdown_v2(
         f"Привет {user.mention_markdown_v2()}\! Отправь мне ссылку на YouTube видео, "
         "и я попробую определить что это за фильм или сериал!"
     )
 
-def handle_message(update: Update, context: CallbackContext) -> None:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик текстовых сообщений"""
     url = update.message.text
     parsed_url = urlparse(url)
     
     if not parsed_url.scheme or not parsed_url.netloc:
-        update.message.reply_text("Пожалуйста, отправьте действительную URL-ссылку")
+        await update.message.reply_text("Пожалуйста, отправьте действительную URL-ссылку")
         return
     
-    update.message.reply_text("🔍 Анализирую видео...")
+    await update.message.reply_text("🔍 Анализирую видео...")
     result = process_video(url)
-    update.message.reply_text(result or "Не удалось определить контент")
+    await update.message.reply_text(result or "Не удалось определить контент")
 
 def main() -> None:
     """Запуск бота"""
@@ -140,17 +140,15 @@ def main() -> None:
         raise ValueError("TELEGRAM_TOKEN не установлен")
     
     # Инициализация бота
-    updater = Updater(token)
-    dispatcher = updater.dispatcher
+    application = Application.builder().token(token).build()
     
     # Регистрация обработчиков
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Запуск
-    updater.start_polling()
     logger.info("Бот запущен...")
-    updater.idle()
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
