@@ -1,6 +1,6 @@
-python-telegram-bot
-pytube
-google-cloud-vision
-requests
-python-dotenv
-ffmpeg-python
+python-telegram-bot[ext]==20.6
+pytube==15.0.0
+google-cloud-vision==3.4.5
+requests==2.31.0
+ffmpeg-python==0.2.0
+python-dotenv==1.0.0
